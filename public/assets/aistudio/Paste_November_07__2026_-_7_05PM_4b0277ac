@@ -1,0 +1,991 @@
+# Kaggle GPU Bridge — Full Windows Application Implementation Plan
+
+Project architecture, development phases, module responsibilities, testing strategy, security requirements, and release criteria
+
+
+
+Architecture agreed
+
+Implementation not started
+
+
+
+## 1. Project objective
+
+Build a lightweight Windows application that connects your Windows PC to a Kaggle notebook/runtime and makes a model running on Kaggle's GPUs accessible to DeepSeek Harness (DSH).
+
+The application must support two ways of connecting DSH to the same remote model:
+
+1. Direct mode: DSH connects through a secure Cloudflare Tunnel to the Kaggle-hosted model API.
+2. Local Bridge mode: DSH connects to a local Windows API at `http://127.0.0.1:8787/v1`. The Windows application forwards requests to the same Kaggle model API.
+
+The application also manages the Kaggle connection, monitors runtime and model status, handles disconnections, and provides a convenient way to configure DSH.
+
+### Core design principles
+
+- One remote model instance: Both access modes must use the same model server. Never load a second model just because the connection mode changes.
+- Kaggle performs inference: The Windows laptop's MX450 and Iris Xe must not be used for model inference.
+- Reuse before restart: Detect and reuse the existing llama.cpp server whenever possible.
+- Separate control and inference: Jupyter manages the Kaggle environment; the model API handles inference.
+- Secure by default: Never expose Jupyter authentication through the public inference endpoint.
+- Verify before integration: Do not declare DSH compatibility until actual structured tool calls and multi-step tool execution pass.
+- Lightweight and maintainable: Start with a Python console application, not Electron, Docker, or a heavy GUI.
+
+## 2. Expected final architecture
+
+[Free 35B Multimodal LLM Server on Kaggle GPU — Accessible from Any OpenAI-Compatible Client - DEV Community](https://images.openai.com/static-rsc-4/cSY7KCxVMW03UxycODQ686mVvmdcU7muQnX-2RuWiSX9G_z9d_bItj6FTkdpDznRYF813VlUuKsxwcE_bLDJcMkRzRBNxR5I5ZAsvFsBDjI1WVV64Cay55HK0YryXCM8e4ECc6oO-UfaNhqZR-m4F_Qd1kpsf9sYJITIWI1eOEw?purpose=inline)
+
+[dev.to](https://dev.to/tahsine/free-35b-multimodal-llm-server-on-kaggle-gpu-accessible-from-any-openai-compatible-client-4m2h?utm_source=chatgpt.com)
+
+The application has two separate communication paths.
+
+### A. Control plane — Kaggle management
+
+The Windows application communicates with the Kaggle Jupyter Server using the VSCode-compatible Jupyter Server URL and its authentication credentials.
+
+It is responsible for:
+
+- Connecting to the correct Jupyter server.
+- Checking whether the Kaggle session is alive.
+- Inspecting notebook kernels and execution state.
+- Running controlled diagnostic commands.
+- Detecting GPU availability.
+- Inspecting the existing model server.
+- Monitoring runtime expiration and reconnection.
+
+Important: A Jupyter Server URL is not an OpenAI-compatible model API URL. These must remain separate in the implementation.
+
+### B. Inference plane — Model requests
+
+The model runs on Kaggle and exposes its inference API.
+
+Direct mode
+
+DeepSeek Harness
+
+OpenAI-compatible provider
+
+HTTPS /v1
+
+Cloudflare Tunnel
+
+Public inference endpoint only
+
+Kaggle llama.cpp server
+
+One model instance · Tesla T4 GPUs
+
+Local Bridge mode
+
+DeepSeek Harness
+
+[http://127.0.0.1:8787/v1](http://127.0.0.1:8787/v1?utm_source=chatgpt.com)
+
+Windows Local Bridge
+
+FastAPI · authentication · forwarding · streaming
+
+Cloudflare Tunnel
+
+Secure remote transport
+
+Same Kaggle llama.cpp server
+
+No second model load
+
+Both modes must use the same remote model endpoint, model identity, and server process. Changing modes must not restart the model.
+
+## 3. Technology stack
+
+| Component          | Technology                  | Reason                             |
+| ------------------ | --------------------------- | ---------------------------------- |
+| Language           | Python 3.11                 | Existing environment compatibility |
+| Console UI         | Rich                        | Lightweight status dashboard       |
+| Local API          | FastAPI + Uvicorn           | OpenAI-compatible HTTP endpoint    |
+| HTTP client        | HTTPX                       | Async requests and streaming       |
+| Jupyter connection | Jupyter REST/WebSocket APIs | Runtime and kernel management      |
+| Configuration      | YAML                        | Human-readable settings            |
+| Secret storage     | Windows Credential Manager  | Protect tokens and API keys        |
+| Tunnel             | Cloudflare Tunnel           | Secure public inference access     |
+| Tests              | Pytest                      | Automated verification             |
+| Packaging          | PyInstaller                 | Optional Windows executable        |
+
+Avoid adding dependencies without a concrete requirement. In particular, do not introduce a heavyweight GUI framework during the first implementation.
+
+## 4. Application modules and responsibilities
+
+I recommend dividing the application into nine logical subsystems.
+
+### 4.1 Application core
+
+Responsible for starting, stopping, and coordinating the Windows application.
+
+| File               | Responsibility                    |
+| ------------------ | --------------------------------- |
+| `main.py`          | Application entry point           |
+| `app/cli.py`       | CLI commands and user interaction |
+| `app/dashboard.py` | Live console dashboard            |
+| `app/state.py`     | Central application state         |
+| `app/events.py`    | Internal events and notifications |
+| `app/lifecycle.py` | Startup and shutdown coordination |
+
+The application core should not directly contain Kaggle API logic or model-specific implementation.
+
+### 4.2 Kaggle connection manager
+
+Responsible for connecting to the remote Jupyter Server.
+
+| File                               | Responsibility                              |
+| ---------------------------------- | ------------------------------------------- |
+| `connection/jupyter_client.py`     | Jupyter HTTP and WebSocket communication    |
+| `connection/authentication.py`     | Authentication and token handling           |
+| `connection/kaggle_session.py`     | Session information and validation          |
+| `connection/connection_monitor.py` | Connection health and expiration monitoring |
+| `connection/reconnect.py`          | Controlled reconnection logic               |
+
+Important requirements:
+
+- Accept the VSCode-compatible Jupyter Server URL.
+- Validate its format and connectivity.
+- Keep credentials separate from the URL where possible.
+- Detect authentication failure and expired sessions.
+- Distinguish a network failure from an expired Kaggle session.
+- Never print Jupyter tokens in logs or diagnostic output.
+
+Do not assume the Jupyter URL alone guarantees that a Kaggle runtime is active.
+
+### 4.3 Remote runtime manager
+
+Responsible for inspecting and managing processes running inside Kaggle.
+
+| File                         | Responsibility                         |
+| ---------------------------- | -------------------------------------- |
+| `remote/executor.py`         | Execute approved remote commands       |
+| `remote/process_manager.py`  | Discover and inspect server processes  |
+| `remote/gpu_monitor.py`      | GPU utilization and memory monitoring  |
+| `remote/health_check.py`     | Server health and model readiness      |
+| `remote/resource_monitor.py` | CPU, RAM, disk and runtime information |
+
+The runtime manager should discover:
+
+- Existing llama.cpp binary.
+- Model file and its exact path.
+- Model server process ID.
+- Server listening port.
+- Server health.
+- GPU devices and memory.
+- Whether the model is actually loaded.
+
+Critical existing-environment protection
+
+The last known Kaggle environment has:
+
+| Item                        | Existing value                           |
+| --------------------------- | ---------------------------------------- |
+| Primary server              | PID 283                                  |
+| Primary port                | 8000                                     |
+| Primary binary              | `/kaggle/working/llama-server`           |
+| Model                       | `qwen2.5-coder-14b-instruct-q4_k_m.gguf` |
+| Model size                  | Approximately 8.37 GiB                   |
+| GPUs                        | 2 × Tesla T4                             |
+| Secondary diagnostic server | PID 359, port 8001                       |
+
+These are previously observed values, not guaranteed current values. The application must rediscover them before acting.
+
+Its default lifecycle policy should be:
+
+`reuse_existing`
+
+That means:
+
+1. Search for an existing server.
+2. Verify its PID and listening port.
+3. Query its health endpoint.
+4. Confirm that the intended model is loaded.
+5. Reuse it if all checks pass.
+6. Report an error if the state is ambiguous.
+
+Do not automatically terminate PID 283 or PID 359, restart the model, or launch a duplicate server.
+
+### 4.4 Model runtime abstraction
+
+The application should avoid hard-coding llama.cpp into every subsystem.
+
+| File                          | Responsibility                  |
+| ----------------------------- | ------------------------------- |
+| `runtime/base.py`             | Common runtime interface        |
+| `runtime/llama_cpp.py`        | llama.cpp implementation        |
+| `runtime/ollama.py`           | Optional Ollama implementation  |
+| `runtime/runtime_registry.py` | Runtime selection and discovery |
+
+Define a common interface for:
+
+- Discovering a running server.
+- Checking model availability.
+- Listing loaded models.
+- Retrieving server configuration.
+- Sending inference requests.
+- Checking runtime health.
+- Starting or stopping a server when explicitly authorized.
+
+Implementation priority: llama.cpp first. Ollama should be added only after the primary workflow is stable.
+
+### 4.5 Networking and tunnel manager
+
+| File                               | Responsibility                       |
+| ---------------------------------- | ------------------------------------ |
+| `networking/cloudflare_manager.py` | Cloudflare Tunnel lifecycle          |
+| `networking/direct_endpoint.py`    | Public inference endpoint management |
+| `networking/local_proxy.py`        | Local Windows forwarding API         |
+| `networking/endpoint_health.py`    | Endpoint validation                  |
+| `networking/network_state.py`      | Network and tunnel state             |
+
+The Cloudflare manager should:
+
+- Start or discover the intended tunnel.
+- Retrieve and validate the public endpoint.
+- Verify that `/v1/models` responds.
+- Detect tunnel disconnection.
+- Reconnect without restarting the model.
+- Avoid printing tunnel credentials.
+
+The local proxy should:
+
+- Bind only to `127.0.0.1`.
+- Listen on port `8787` by default.
+- Forward requests to the remote inference API.
+- Preserve HTTP status codes and error bodies.
+- Support streaming responses.
+- Support request cancellation and timeouts.
+- Avoid logging prompt contents or authentication headers.
+
+Do not build a second model-serving layer on Windows.
+
+### 4.6 OpenAI-compatible API layer
+
+This is one of the most important parts of the application.
+
+| File                        | Responsibility                   |
+| --------------------------- | -------------------------------- |
+| `api/openai_compat.py`      | OpenAI API compatibility         |
+| `api/streaming.py`          | Server-Sent Events forwarding    |
+| `api/tool_validation.py`    | Structured tool-call validation  |
+| `api/error_handling.py`     | Consistent error translation     |
+| `api/request_validation.py` | Incoming request validation      |
+| `api/models.py`             | Model identity and model listing |
+
+Required endpoints:
+
+| Endpoint                    | Purpose                       |
+| --------------------------- | ----------------------------- |
+| `GET /v1/models`            | Model discovery               |
+| `POST /v1/chat/completions` | Chat completion               |
+| `GET /health`               | Local bridge health           |
+| `GET /status`               | Application connection status |
+
+The local bridge must support:
+
+- Normal chat completions.
+- Streaming and non-streaming responses.
+- Authentication forwarding.
+- Request timeout handling.
+- Client disconnection handling.
+- Error propagation.
+- Correct model-name mapping.
+
+It should not modify or fabricate tool calls merely to make an API response appear compatible.
+
+### 4.7 DSH integration
+
+| File                              | Responsibility                      |
+| --------------------------------- | ----------------------------------- |
+| `providers/dsh_config.py`         | Generate DSH provider configuration |
+| `providers/model_registry.py`     | Model names and capabilities        |
+| `providers/provider_templates.py` | Direct and Local provider templates |
+| `providers/compatibility_test.py` | DSH compatibility checks            |
+
+The application should generate the provider configuration for both modes.
+
+Direct provider
+
+```
+base_url: "https://YOUR-CLOUDFLARE-ENDPOINT/v1"
+model: "qwen25-coder"
+```
+
+Local provider
+
+```
+base_url: "http://127.0.0.1:8787/v1"
+model: "qwen25-coder"
+```
+
+These are conceptual configuration examples. The exact DSH configuration schema must be verified against the installed DSH version before generating a final configuration file.
+
+Initially, generate a configuration file for the user to review and copy. Do not assume DSH exposes a supported API for automatic provider registration.
+
+### 4.8 Security subsystem
+
+| File                           | Responsibility                         |
+| ------------------------------ | -------------------------------------- |
+| `security/credential_store.py` | Windows Credential Manager integration |
+| `security/token_manager.py`    | Token lifecycle                        |
+| `security/secret_redaction.py` | Log and output redaction               |
+| `security/local_auth.py`       | Local bridge authentication            |
+
+Security rules:
+
+1. Store Jupyter credentials in Windows Credential Manager.
+2. Store Cloudflare credentials securely.
+3. Store model API keys securely.
+4. Never write secrets to YAML or JSON configuration files.
+5. Never expose Jupyter authentication through Cloudflare.
+6. Never bind the local API to `0.0.0.0`.
+7. Do not log API keys, tokens, authorization headers, or prompt contents.
+8. Use bounded connection and request timeouts.
+9. Do not automatically terminate remote processes on local shutdown.
+10. Require explicit confirmation before stopping the remote model.
+
+Previously exposed model API keys should be rotated before exposing the inference endpoint publicly.
+
+### 4.9 Configuration and logging
+
+| File                   | Responsibility            |
+| ---------------------- | ------------------------- |
+| `config/defaults.yaml` | Safe application defaults |
+| `config/loader.py`     | Configuration loading     |
+| `config/validator.py`  | Configuration validation  |
+| `logging/setup.py`     | Structured logging        |
+| `logging/redaction.py` | Sensitive-data filtering  |
+
+Keep non-secret settings in configuration:
+
+- Jupyter server address.
+- Model API port.
+- Local proxy port.
+- Preferred runtime.
+- Connection timeouts.
+- Retry limits.
+- Default access mode.
+- Model name.
+- Remote model port.
+
+Credentials must be stored separately.
+
+## 5. Recommended project structure
+
+I recommend this structure for the initial implementation:
+
+```
+Kaggle-GPU-Bridge/
+│
+├── main.py
+├── pyproject.toml
+├── requirements.txt
+├── README.md
+├── .gitignore
+│
+├── app/
+│   ├── __init__.py
+│   ├── cli.py
+│   ├── dashboard.py
+│   ├── state.py
+│   ├── events.py
+│   └── lifecycle.py
+│
+├── connection/
+│   ├── __init__.py
+│   ├── jupyter_client.py
+│   ├── authentication.py
+│   ├── kaggle_session.py
+│   ├── connection_monitor.py
+│   └── reconnect.py
+│
+├── remote/
+│   ├── __init__.py
+│   ├── executor.py
+│   ├── process_manager.py
+│   ├── gpu_monitor.py
+│   ├── resource_monitor.py
+│   └── health_check.py
+│
+├── runtime/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── llama_cpp.py
+│   ├── ollama.py
+│   └── runtime_registry.py
+│
+├── networking/
+│   ├── __init__.py
+│   ├── cloudflare_manager.py
+│   ├── direct_endpoint.py
+│   ├── local_proxy.py
+│   ├── endpoint_health.py
+│   └── network_state.py
+│
+├── api/
+│   ├── __init__.py
+│   ├── openai_compat.py
+│   ├── streaming.py
+│   ├── tool_validation.py
+│   ├── request_validation.py
+│   ├── error_handling.py
+│   └── models.py
+│
+├── providers/
+│   ├── __init__.py
+│   ├── dsh_config.py
+│   ├── model_registry.py
+│   ├── provider_templates.py
+│   └── compatibility_test.py
+│
+├── security/
+│   ├── __init__.py
+│   ├── credential_store.py
+│   ├── token_manager.py
+│   ├── secret_redaction.py
+│   └── local_auth.py
+│
+├── config/
+│   ├── defaults.yaml
+│   ├── loader.py
+│   └── validator.py
+│
+├── logging/
+│   ├── setup.py
+│   └── redaction.py
+│
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   ├── security/
+│   └── acceptance/
+│
+├── scripts/
+│   ├── setup.bat
+│   ├── start.bat
+│   └── diagnostic.bat
+│
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── IMPLEMENTATION_PLAN.md
+    ├── SECURITY.md
+    ├── TROUBLESHOOTING.md
+    └── DSH_SETUP.md
+```
+
+The structure is deliberately modular, but implementation should be incremental. Do not create dozens of empty files before the first working connection.
+
+## 6. Application state model
+
+The application needs a single source of truth for its state.
+
+Recommended states:
+
+| State               | Meaning                                   |
+| ------------------- | ----------------------------------------- |
+| `DISCONNECTED`      | No valid Kaggle connection                |
+| `CONNECTING`        | Jupyter connection being established      |
+| `CONNECTED`         | Jupyter session authenticated             |
+| `RUNTIME_READY`     | Kaggle execution environment available    |
+| `MODEL_DISCOVERING` | Searching for an existing model server    |
+| `MODEL_LOADED`      | Intended model confirmed available        |
+| `TUNNEL_CONNECTING` | Cloudflare tunnel being established       |
+| `DIRECT_READY`      | Public inference endpoint verified        |
+| `LOCAL_READY`       | Local bridge verified                     |
+| `DEGRADED`          | Some functionality unavailable            |
+| `SESSION_EXPIRED`   | Kaggle session expired or invalid         |
+| `ERROR`             | An unrecoverable operation error occurred |
+
+The application should distinguish:
+
+- Kaggle connection status.
+- Remote runtime status.
+- Model status.
+- Tunnel status.
+- Local proxy status.
+- DSH compatibility status.
+
+A single green `CONNECTED` indicator must not imply that the model is loaded or that DSH tool calling works.
+
+### Example dashboard
+
+Kaggle GPU Bridge
+
+Connected
+
+Kaggle session
+
+Connected
+
+Model server
+
+Loaded
+
+Remote GPU
+
+2 × Tesla T4
+
+Model port
+
+8000
+
+Direct endpoint
+
+Ready
+
+Local bridge
+
+Ready
+
+Active model\
+`qwen2.5-coder-14b-instruct-q4_k_m.gguf`
+
+Illustrative dashboard only. Actual status must come from live checks.
+
+## 7. Full implementation phases
+
+The implementation should proceed in the following order. Each phase must have a working deliverable and acceptance tests before the next phase begins.
+
+## Phase roadmap
+
+1. Phase 0 — Existing environment audit
+
+   First priority
+   - Inspect the current Kaggle notebook and process state.
+   - Verify the primary model server and model file.
+   - Confirm the current Jupyter connection method.
+   - Identify the Cloudflare Tunnel setup.
+   - Record current API compatibility and tool-calling limitations.
+   Deliverable: Verified baseline report and a safe integration specification.
+2. Phase 1 — Windows application foundation
+   - Create the Python 3.11 project.
+   - Build CLI commands.
+   - Implement configuration loading and validation.
+   - Implement application state.
+   - Implement secure logging.
+   - Add Windows Credential Manager integration.
+   Deliverable: Windows app launches, displays status, and safely stores credentials. No Kaggle changes.
+3. Phase 2 — Jupyter connection
+   - Accept the Jupyter Server URL.
+   - Authenticate.
+   - Query server information.
+   - Inspect kernels and sessions.
+   - Execute a harmless diagnostic command.
+   - Detect session expiration.
+   - Add controlled reconnect behavior.
+   Deliverable: Reliable authenticated Kaggle connection and diagnostic report.
+4. Phase 3 — Remote runtime discovery
+   - Detect both Tesla T4 GPUs.
+   - Discover the existing llama.cpp process.
+   - Verify PID and port.
+   - Inspect model identity.
+   - Query health endpoints.
+   - Monitor GPU memory and server availability.
+   Deliverable: Application can identify and monitor the existing model server without restarting it.
+5. Phase 4 — Direct endpoint
+   - Implement Cloudflare Tunnel management.
+   - Validate public endpoint connectivity.
+   - Test API authentication.
+   - Test `/v1/models`.
+   - Test normal chat completion.
+   - Test streaming.
+   - Test tunnel interruption and recovery.
+   Deliverable: DSH can reach the Kaggle-hosted API directly, subject to API compatibility.
+6. Phase 5 — Local Bridge
+   - Implement FastAPI local service.
+   - Bind to `127.0.0.1:8787`.
+   - Forward requests to the remote endpoint.
+   - Preserve headers and errors safely.
+   - Implement streaming.
+   - Implement cancellation and timeout handling.
+   - Test local-to-remote forwarding.
+   Deliverable: Local OpenAI-compatible endpoint forwards requests to the same remote model.
+7. Phase 6 — DSH compatibility
+
+   Critical release gate
+   - Verify DSH provider schema.
+   - Generate Direct and Local provider configurations.
+   - Test normal completion.
+   - Test structured `tool_calls`.
+   - Test arguments against declared tool schemas.
+   - Test tool result continuation.
+   - Test multi-step agent execution.
+   - Test streaming tool calls.
+   Deliverable: DSH successfully uses the model as a coding agent, not merely as a chat endpoint.
+8. Phase 7 — Unified management
+   - Add a single dashboard.
+   - Add access-mode switching.
+   - Add start/stop/reconnect commands.
+   - Add safe shutdown.
+   - Add diagnostic export.
+   - Add clear error messages and recovery instructions.
+   Deliverable: One application manages the complete workflow.
+9. Phase 8 — Packaging and documentation
+   - Create Windows setup scripts.
+   - Create launcher scripts.
+   - Add PyInstaller packaging.
+   - Document credentials and setup.
+   - Document DSH configuration.
+   - Add recovery and troubleshooting instructions.
+   Deliverable: Reproducible Windows installation and user documentation.
+
+## 8. Critical issue: structured tool calling
+
+This deserves its own implementation and testing phase because it is the most important unresolved compatibility problem.
+
+The previous tests with Qwen2.5-Coder-14B-Instruct Q4_K_M showed that llama.cpp sometimes returned tool-like content as ordinary assistant text, for example:
+
+```
+<tools>
+{"name": "get_weather", "arguments": {"city": "Dhaka"}}
+</tools>
+```
+
+But the API response did not contain a valid structured `message.tool_calls` object.
+
+That is not sufficient for DSH agent operation.
+
+### Required distinction
+
+Ordinary text output
+
+Fail
+
+The model prints a function name and JSON in its message content.
+
+Structured tool call
+
+Required
+
+The API returns a valid `tool_calls` array with a function name, JSON arguments, and an appropriate finish reason.
+
+### Tool-calling acceptance tests
+
+| Test                   | Required result                              |
+| ---------------------- | -------------------------------------------- |
+| Tool declaration       | API accepts the tool schema                  |
+| `tool_choice=auto`     | Model can choose a tool                      |
+| `tool_choice=required` | Model produces a tool call when required     |
+| Structured response    | `message.tool_calls` is populated            |
+| Function name          | Matches a declared tool                      |
+| Arguments              | Valid JSON                                   |
+| Schema validation      | Arguments satisfy the requested schema       |
+| Tool execution         | DSH executes the requested tool              |
+| Continuation           | Tool result is sent back to the model        |
+| Multi-step             | Model can make another tool call when needed |
+| Streaming              | Tool-call deltas are correctly delivered     |
+
+### Important implementation rule
+
+Do not immediately implement a text-to-tool-call parser to hide the underlying issue.
+
+First investigate:
+
+1. llama.cpp version and build configuration.
+2. Qwen chat-template selection.
+3. The actual runtime chat format.
+4. Whether the model's generated tokens follow the expected tool-call format.
+5. Whether the llama.cpp parser recognizes those tokens.
+6. Whether the OpenAI-compatible endpoint returns the correct structured response.
+7. Whether DSH supports the specific API behavior.
+
+If an adapter is later necessary, it must validate every parsed function name and argument against the original tool schema. It must reject malformed, undeclared, or ambiguous calls. It must never execute arbitrary function names extracted from text.
+
+Release decision: DSH provider integration must remain marked experimental until these tests pass.
+
+## 9. Connection failure and recovery strategy
+
+The application must not confuse a Windows disconnect with a Kaggle runtime failure.
+
+| Failure                             | Expected behavior                                       |
+| ----------------------------------- | ------------------------------------------------------- |
+| Windows loses internet              | Keep remote server running; retry connection            |
+| Jupyter URL temporarily unavailable | Retry with bounded backoff                              |
+| Jupyter authentication fails        | Report authentication error                             |
+| Kaggle session expires              | Mark `SESSION_EXPIRED`; do not claim model is available |
+| Cloudflare disconnects              | Reconnect tunnel; do not restart model                  |
+| Local proxy crashes                 | Restart local proxy only                                |
+| Remote model crashes                | Report model failure; require explicit recovery         |
+| Model file disappears               | Report missing model; do not download automatically     |
+| GPU unavailable                     | Report remote GPU problem; do not fall back to MX450    |
+| DSH request times out               | Return an appropriate API error                         |
+
+A local Windows application shutdown must not automatically stop the remote Kaggle server.
+
+## 10. Testing strategy
+
+Testing should be divided into four levels.
+
+### Unit tests
+
+Test individual components without connecting to Kaggle:
+
+- Configuration parser.
+- State transitions.
+- Credential store interface.
+- Request validation.
+- Tool-call validation.
+- Error translation.
+- Streaming parser.
+- Retry policy.
+
+### Integration tests
+
+Use controlled mock services where possible:
+
+- Jupyter client to mock Jupyter API.
+- HTTPX client to mock the model API.
+- Local FastAPI proxy to a mock upstream.
+- Cloudflare manager to a mock process interface.
+
+### Kaggle integration tests
+
+Run these against the real Kaggle environment only when explicitly planned:
+
+- Jupyter authentication.
+- GPU discovery.
+- Existing server discovery.
+- Model identity verification.
+- Remote health check.
+- Public endpoint validation.
+- Real inference request.
+
+Tests should not require a model restart.
+
+### DSH acceptance tests
+
+Run these against the actual DSH application and the actual model:
+
+1. Configure Direct mode.
+2. Send a normal prompt.
+3. Verify the returned model response.
+4. Configure Local Bridge mode.
+5. Repeat the same request.
+6. Compare results and server identity.
+7. Execute a real DSH tool call.
+8. Verify the structured API response.
+9. Verify tool result continuation.
+10. Execute a multi-step task.
+
+### Final acceptance checklist
+
+Release acceptance
+
+# 0/14
+
+Windows app starts and exits cleanly
+
+No unexpected background processes
+
+Jupyter authentication works
+
+Credentials are never exposed in logs
+
+Kaggle runtime is discovered
+
+No unnecessary kernel or runtime restart
+
+Both T4 GPUs are detected
+
+No local MX450 inference
+
+Existing model server is reused
+
+No duplicate model instance
+
+Direct mode works
+
+Public endpoint reaches the existing model
+
+Local mode works
+
+127.0.0.1:8787 forwards correctly
+
+Both modes use the same model
+
+No model reload when switching
+
+Streaming works
+
+Chunks and termination are preserved
+
+Structured tool calls work
+
+Valid message.tool_calls returned
+
+Tool continuation works
+
+DSH can execute multi-step tasks
+
+Session expiry is handled
+
+No false connected state
+
+Security tests pass
+
+No exposed credentials or public Jupyter endpoint
+
+Documentation and setup scripts work
+
+Reproducible Windows installation
+
+Reset checklist
+
+This is a planning checklist, not an indication that these tests have already passed.
+
+## 11. Resource and performance requirements
+
+The Windows machine should only manage connections and forward requests. It should not perform model inference.
+
+Recommended initial constraints:
+
+| Resource     | Design target                                                      |
+| ------------ | ------------------------------------------------------------------ |
+| Python       | 3.11                                                               |
+| CPU          | Low background usage                                               |
+| RAM          | Keep idle app overhead modest; target below 150 MB where practical |
+| GPU          | No local inference or CUDA initialization                          |
+| Disk         | Small application and logs; no model downloads                     |
+| Network      | Stream requests rather than buffering full responses               |
+| Processes    | One local app and one local proxy                                  |
+| Remote model | Reuse the existing Kaggle server                                   |
+
+These are engineering targets, not measured performance guarantees.
+
+Avoid:
+
+- Loading PyTorch on Windows.
+- Downloading GGUF files to the laptop.
+- Running a local model server.
+- Polling Jupyter too frequently.
+- Keeping unnecessary WebSocket connections open.
+- Buffering large streaming responses.
+- Starting duplicate Kaggle servers.
+
+## 12. CLI command design
+
+The first version should be usable without a GUI.
+
+Suggested commands:
+
+```
+# Launch the application dashboard
+python main.py
+
+# Configure the Kaggle Jupyter connection
+python main.py configure
+
+# Test Jupyter connection
+python main.py connect
+
+# Inspect Kaggle runtime and GPUs
+python main.py inspect
+
+# Discover the existing model server
+python main.py model discover
+
+# Check model server health
+python main.py model health
+
+# Start or reconnect the Cloudflare tunnel
+python main.py tunnel connect
+
+# Start the local forwarding API
+python main.py bridge start
+
+# Stop the local forwarding API
+python main.py bridge stop
+
+# Select access mode
+python main.py mode direct
+python main.py mode local
+
+# Generate DSH provider configuration
+python main.py dsh config
+
+# Run compatibility diagnostics
+python main.py test compatibility
+
+# Export diagnostic information
+python main.py diagnostics
+```
+
+Remote model stop/restart commands should not be enabled by default. They should require explicit confirmation and a separate safety check.
+
+## 13. Development priorities and boundaries
+
+The most efficient implementation order is not to build every module at once. It is to establish a reliable vertical slice first.
+
+| Priority | Work                              | Reason                             |
+| -------- | --------------------------------- | ---------------------------------- |
+| P0       | Existing Kaggle environment audit | Prevent accidental disruption      |
+| P0       | Windows app foundation            | Establish stable architecture      |
+| P0       | Jupyter connection                | Required control plane             |
+| P0       | Existing model discovery          | Reuse the working server           |
+| P1       | Direct endpoint                   | First usable remote inference path |
+| P1       | Local Bridge                      | Second access path                 |
+| P1       | Streaming and error handling      | Required for DSH                   |
+| P0       | Structured tool-call verification | Essential for agent functionality  |
+| P2       | Dashboard improvements            | Convenience                        |
+| P2       | Ollama runtime                    | Optional expansion                 |
+| P3       | GUI                               | Only after CLI is stable           |
+| P3       | Executable packaging              | Final distribution                 |
+
+The structured tool-calling investigation should run alongside the transport work. It must not be postponed until the end, because it could change the API compatibility architecture.
+
+## 14. Risks and design decisions
+
+| Risk                                  | Mitigation                                                  |
+| ------------------------------------- | ----------------------------------------------------------- |
+| Kaggle session expiration             | Explicit session state and recovery instructions            |
+| Existing server accidentally killed   | Discovery-first lifecycle; no automatic termination         |
+| Duplicate model loads                 | Single-instance checks and reuse policy                     |
+| Cloudflare URL changes                | Dynamic endpoint discovery and validation                   |
+| API key exposure                      | Credential Manager and log redaction                        |
+| Jupyter token exposure                | Separate control and inference planes                       |
+| Tool calls returned as text           | Dedicated parser/template investigation and acceptance gate |
+| DSH provider schema differs           | Verify installed DSH version before generating configs      |
+| Streaming incompatibility             | End-to-end SSE tests                                        |
+| Local proxy security issue            | Loopback-only binding and authentication                    |
+| Tunnel works but model is unavailable | Independent tunnel and model health checks                  |
+
+## 15. Final definition of done
+
+The Windows application is complete only when all of the following are true:
+
+1. It can securely connect to a Kaggle Jupyter Server.
+2. It can identify the active Kaggle runtime and its GPUs.
+3. It can detect and reuse the existing llama.cpp model server.
+4. It can expose the model through a validated Cloudflare endpoint.
+5. It can provide a localhost API through the Windows bridge.
+6. Both modes use the same remote model server.
+7. Streaming and error handling work correctly.
+8. DSH can connect in either mode.
+9. DSH receives actual structured tool calls.
+10. DSH can execute tool results and continue its reasoning.
+11. Kaggle disconnections are handled without unsafe process termination.
+12. Credentials remain protected.
+13. The application can be installed and launched reproducibly on Windows.
+
+The most important architectural decision: Kaggle GPU Bridge should be a connection and management application, not another model-serving system. It manages access to the existing remote model; it does not duplicate it.
+
+## 16. Recommended next implementation step
+
+Start with Phase 0 and Phase 1, not the tunnel or GUI.
+
+The first implementation task should produce:
+
+- A verified Kaggle environment baseline.
+- A clean Python 3.11 project.
+- A working Rich CLI dashboard.
+- A central application state model.
+- Secure credential storage.
+- Configuration validation.
+- Unit tests.
+- No changes to the running Kaggle model server.
+
+After that, implement the Jupyter connection and remote model discovery. This gives us a safe foundation before introducing network exposure or DSH integration.
+
+The next useful deliverable is a paste-ready OpenCode implementation prompt for Phase 0 + Phase 1, with explicit file-by-file tasks, safety restrictions, tests, and completion-report requirements.
